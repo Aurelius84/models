@@ -24,6 +24,8 @@ cfg = _C
 # Training options
 #
 
+_C.input_size = 608
+
 # Snapshot period
 _C.snapshot_iter = 2000
 
@@ -38,7 +40,7 @@ _C.max_box_num = 50
 #
 
 # valid score threshold to include boxes
-_C.valid_thresh = 0.005
+_C.valid_thresh = 0.01
 
 # threshold vale for box non-max suppression
 _C.nms_thresh = 0.45

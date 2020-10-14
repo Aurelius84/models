@@ -26,6 +26,7 @@ from paddle.fluid.contrib.layers import basic_lstm
 
 def lm_model(hidden_size,
              vocab_size,
+             batch_size,
              num_layers=2,
              num_steps=20,
              init_scale=0.1,
@@ -184,15 +185,45 @@ def lm_model(hidden_size,
                 pre_cell = cell_array[k]
                 weight_1 = weight_1_arr[k]
                 bias = bias_arr[k]
+
                 nn = layers.concat([input, pre_hidden], 1)
                 gate_input = layers.matmul(x=nn, y=weight_1)
 
                 gate_input = layers.elementwise_add(gate_input, bias)
                 i, j, f, o = layers.split(gate_input, num_or_sections=4, dim=-1)
 
-                c = pre_cell * layers.sigmoid(f) + layers.sigmoid(
-                    i) * layers.tanh(j)
-                m = layers.tanh(c) * layers.sigmoid(o)
+                try:
+                    from paddle.fluid.contrib.layers import fused_elemwise_activation
+                    # fluid.contrib.layers.fused_elemwise_activation can do a fused
+                    # operation, like:
+                    # 1) x + sigmoid(y); x + tanh(y)
+                    # 2) tanh(x + y)
+                    # Now the unary operation supported in this fused op is limit, and
+                    # we will extent this operation to support more unary operations and
+                    # do this kind of fusion automitically in future version of paddle.fluid.
+                    # layers.sigmoid(i) * layers.tanh(j)
+                    tmp0 = fused_elemwise_activation(
+                        x=layers.tanh(j),
+                        y=i,
+                        functor_list=['elementwise_mul', 'sigmoid'],
+                        save_intermediate_out=False)
+                    # pre_cell * layers.sigmoid(f)
+                    tmp1 = fused_elemwise_activation(
+                        x=pre_cell,
+                        y=f,
+                        functor_list=['elementwise_mul', 'sigmoid'],
+                        save_intermediate_out=False)
+                    c = tmp0 + tmp1
+                    # layers.tanh(c) * layers.sigmoid(o)
+                    m = fused_elemwise_activation(
+                        x=layers.tanh(c),
+                        y=o,
+                        functor_list=['elementwise_mul', 'sigmoid'],
+                        save_intermediate_out=False)
+                except ImportError:
+                    c = pre_cell * layers.sigmoid(f) + layers.sigmoid(
+                        i) * layers.tanh(j)
+                    m = layers.tanh(c) * layers.sigmoid(o)
 
                 hidden_array[k] = m
                 cell_array[k] = c
@@ -223,32 +254,35 @@ def lm_model(hidden_size,
 
         return real_res, last_hidden, last_cell
 
-    x = fluid.data(name="x", shape=[None, num_steps], dtype='int64')
-    # y = fluid.data(name="y", shape=[None, 1], dtype='int64')
+    batch_size_each = batch_size # // fluid.core.get_cuda_device_count()
+    x = fluid.data(
+        name="x", shape=[batch_size_each, num_steps, 1], dtype='int64')
+    y = fluid.data(
+        name="y", shape=[batch_size_each * num_steps, 1], dtype='int64')
 
-    # if use_dataloader:
-    #     dataloader = fluid.io.DataLoader.from_generator(
-    #         feed_list=[x, y],
-    #         capacity=16,
-    #         iterable=False,
-    #         use_double_buffer=True)
+    if use_dataloader:
+        dataloader = fluid.io.DataLoader.from_generator(
+            feed_list=[x, y],
+            capacity=16,
+            iterable=False,
+            use_double_buffer=True)
 
     init_hidden = fluid.data(
         name="init_hidden",
-        shape=[num_layers, None, hidden_size],
+        shape=[num_layers, batch_size_each, hidden_size],
         dtype='float32')
     init_cell = fluid.data(
         name="init_cell",
-        shape=[num_layers, None, hidden_size],
+        shape=[num_layers, batch_size_each, hidden_size],
         dtype='float32')
 
-    # init_hidden = layers.transpose(init_hidden, perm=[1, 0, 2])
-    # init_cell = layers.transpose(init_cell, perm=[1, 0, 2])
+    init_cell.persistable = True
+    init_hidden.persistable = True
 
-    # init_hidden_reshape = layers.reshape(
-    #     init_hidden, shape=[num_layers, -1, hidden_size])
-    # init_cell_reshape = layers.reshape(
-    #     init_cell, shape=[num_layers, -1, hidden_size])
+    init_hidden_reshape = layers.reshape(
+        init_hidden, shape=[num_layers, -1, hidden_size])
+    init_cell_reshape = layers.reshape(
+        init_cell, shape=[num_layers, -1, hidden_size])
 
     x_emb = fluid.embedding(
         input=x,
@@ -260,26 +294,26 @@ def lm_model(hidden_size,
             initializer=fluid.initializer.UniformInitializer(
                 low=-init_scale, high=init_scale)))
 
-    # x_emb = layers.reshape(
-    #     x_emb, shape=[-1, num_steps, hidden_size], inplace=True)
-    # if dropout != None and dropout > 0.0:
-    #     x_emb = layers.dropout(
-    #         x_emb,
-    #         dropout_prob=dropout,
-    #         dropout_implementation='upscale_in_train')
+    x_emb = layers.reshape(
+        x_emb, shape=[-1, num_steps, hidden_size], inplace=True)
+    if dropout != None and dropout > 0.0:
+        x_emb = layers.dropout(
+            x_emb,
+            dropout_prob=dropout,
+            dropout_implementation='upscale_in_train')
 
     if rnn_model == "padding":
         rnn_out, last_hidden, last_cell = padding_rnn(
             x_emb,
             len=num_steps,
-            init_hidden=init_hidden,
-            init_cell=init_cell)
+            init_hidden=init_hidden_reshape,
+            init_cell=init_cell_reshape)
     elif rnn_model == "static":
         rnn_out, last_hidden, last_cell = encoder_static(
             x_emb,
             len=num_steps,
-            init_hidden=init_hidden,
-            init_cell=init_cell)
+            init_hidden=init_hidden_reshape,
+            init_cell=init_cell_reshape)
     elif rnn_model == "cudnn":
         x_emb = layers.transpose(x_emb, perm=[1, 0, 2])
         rnn_out, last_hidden, last_cell = layers.lstm(
@@ -332,13 +366,16 @@ def lm_model(hidden_size,
     # loss = layers.reduce_sum(loss)
 
     # loss.persistable = True
+    last_cell.persistable = True
+    last_hidden.persistable = True
 
     # This will feed last_hidden, last_cell to init_hidden, init_cell, which
     # can be used directly in next batch. This can avoid the fetching of
     # last_hidden and last_cell and feeding of init_hidden and init_cell in
     # each training step.
-    last_hidden = layers.transpose(last_hidden, perm=[1, 0, 2])
-    last_cell = layers.transpose(last_cell, perm=[1, 0, 2])
+    layers.assign(input=last_cell, output=init_cell)
+    layers.assign(input=last_hidden, output=init_hidden)
+
     # feeding_list = ['x', 'y', 'init_hidden', 'init_cell']
     feeding_list = ['x', 'init_hidden', 'init_cell']
     if use_dataloader:

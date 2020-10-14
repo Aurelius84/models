@@ -180,6 +180,63 @@ def check_version():
         sys.exit(1)
 
 
+def save_inference_model():
+
+    num_layers = 2
+    src_vocab_size = 17191
+    tar_vocab_size = 7709
+    batch_size = 2
+    dropout = 0.0
+    init_scale = 0.1
+    max_grad_norm = 5.0
+    hidden_size = 512
+    # inference process
+
+    print("src", src_vocab_size)
+
+    # dropout type using upscale_in_train, dropout can be remove in inferecen
+    # So we can set dropout to 0
+    # if arg:
+    #     model = AttentionModel(
+    #         hidden_size,
+    #         src_vocab_size,
+    #         tar_vocab_size,
+    #         batch_size,
+    #         num_layers=num_layers,
+    #         init_scale=init_scale,
+    #         dropout=0.0)
+    # else:
+
+    model = BaseModel(
+        hidden_size,
+        src_vocab_size,
+        tar_vocab_size,
+        batch_size,
+        num_layers=num_layers,
+        init_scale=init_scale,
+        beam_max_step_num=50,
+        dropout=0.0)
+
+    beam_size = 10
+    # 组网
+    trans_res = model.build_graph(mode='beam_search', beam_size=beam_size)
+    # clone from default main program and use it as the validation program
+    main_program = fluid.default_main_program()
+    
+    model_dir = '/workspace/code_dev/paddle-predict/paddle/static/seq2seq'
+
+    exe = fluid.Executor(fluid.CPUPlace())
+    exe.run(fluid.default_startup_program())
+
+    fluid.io.save_inference_model(model_dir, 
+                                feeded_var_names=['src', 'src_sequence_length'], 
+                                target_vars=[trans_res], 
+                                executor=exe,
+                                main_program=main_program,
+                                model_filename='model',
+                                params_filename='params')
+
 if __name__ == '__main__':
-    check_version()
-    infer()
+    # check_version()
+    # infer()
+    save_inference_model()
